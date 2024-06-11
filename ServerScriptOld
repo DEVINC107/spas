@@ -1,0 +1,595 @@
+local event = nil
+
+--[[event VERY VERY EXPERIMENTAL (HAS EDGE CASES PROB) SIG IMPL]]
+do
+	local SIG_RECYCLE_THRESHOLD=20
+	local nextFn=nil
+	local eventRunner 
+	event = {}
+	event.__index = event
+	function event.new()
+		return setmetatable({_fns={},_dead=0},event)
+	end
+	function event:Connect(fn)
+		local k=table.create(2)
+		table.insert(k,fn)
+		table.insert(self._fns,k)
+		return function()
+			self._dead+=1
+			table.insert(k,true)
+		end
+	end
+	--[[
+		stolen perf from goodsignal. i think creating a billion coroutines is bad!!!!
+		so we have a eventRunner coroutine that is recycled to run the events
+		so we set eventRunner to a coroutine that calls the connected function
+		when we spawn eventRunner without yielding event runner will be recycled
+		when it does yield, we will spawn a new thread
+	]]
+	function event:Fire(...)
+		for _, cur in ipairs(self._fns) do
+			if cur[2] then
+				continue
+			end
+			nextFn=cur[1]
+			if eventRunner == nil then
+				local function run(...)
+					local j = eventRunner
+					eventRunner=nil
+					nextFn(...)
+					if eventRunner ~= nil then
+						return
+					end
+					eventRunner = j
+				end
+				eventRunner = coroutine.create(function(...)
+					run(...)
+					while true do
+						run(coroutine.yield())
+					end
+				end)
+			end
+			task.spawn(eventRunner,...)
+		end
+		if self._dead>=SIG_RECYCLE_THRESHOLD then
+			for i, cur in self._fns do
+				if cur[2] then
+					table.remove(self._fns,i)
+					i-=1
+				end
+			end
+		end
+	end
+	function event:Once(fn)
+		local disconnect
+		disconnect = event:Connect(function(...)
+			disconnect()
+			fn(...)
+		end)
+	end
+	function event:Wait()
+		local c = coroutine.running()
+		local conn = self:Connect(function(...)
+			task.spawn(c,...)
+		end)
+		return coroutine.yield()
+	end
+end
+
+local cs=game:GetService("CollectionService")
+local remote=game.ReplicatedStorage.RemoteEvent
+local util=require(game.ReplicatedStorage.util)
+local all={}
+local tempByZones={
+	cold=-2
+}
+local nextEid=1
+local function position(c)
+	return c.HumanoidRootPart.Position
+end
+local function every(t,fn)
+	local accum=0
+	return game:GetService("RunService").Heartbeat:Connect(function(dt)
+		accum+=dt
+		if accum >= t then
+			accum-=t
+			fn(dt)
+		end
+	end)
+end
+--[[zone is one of the things that affects temperature]]
+local function onCharacterAdded(c,data)
+	c:SetAttribute("eid",data.eid)
+	local g=Instance.new("Motor6D")
+	g.Part0=c["Right Arm"]
+	g.Name="Grip"
+	g.Parent=c["Right Arm"]
+	data.model=c
+	data.temperature=100
+	data.zone="cold"
+	data.hit=event.new()
+	data.hit:Connect(function()
+		c.Humanoid.Health-=5
+	end)
+	remote:FireClient(data.player,"zoneChanged",tick(),data.zone,data.temperature,tempByZones[data.zone])
+	local campfireConn
+	campfireConn=every(1,function()
+		local inRange={}
+		for _,campfire in game.CollectionService:GetTagged("campfire") do
+			local d=(c.HumanoidRootPart.Position-campfire.Position).Magnitude
+			if d<=5 then
+				table.insert(inRange,{distance=d})
+			end
+		end
+		for _,c in inRange do
+			data.temperature+=10/c.distance
+		end
+		remote:FireClient(data.player,"temperatureChanged",data.temperature)
+	end)
+	local magicConn
+	data.magic=nil
+	magicConn=data.player.Chatted:Connect(function(msg)
+		if msg:sub(1,5):lower()=="jared" then
+			data.magic={}
+		end
+		if msg:find("light a fire for me") and data.magic then
+			data.magic.command = "fire"
+		end
+		if msg:find("I am your most worthy") then
+			data.magic.finished = true
+		end
+	end)
+	c.Destroying:Once(function()
+		campfireConn:Disconnect()
+	end)
+	c.Humanoid:GetPropertyChangedSignal("MoveDirection"):Connect(function()
+		if c.Humanoid.WalkSpeed>0 then
+			c:SetAttribute("LastMoved",tick())
+		end
+	end)
+end
+game:GetService("RunService").Heartbeat:Connect(function(dt)
+	for _,player in game:GetService("Players"):GetPlayers() do
+		if player.Character then
+			local data=all[player.Character:GetAttribute("eid")]
+			if data.zone then
+				data.temperature+=tempByZones[data.zone]*dt
+				if data.temperature<=0 then
+					data.model.Humanoid.Health=0
+				end
+			end
+		end
+	end
+end)
+local function onPlayerAdded(player)
+	local id=nextEid
+	nextEid+=1
+	all[id]={inventory={},eid=id,player=player}
+	if player.Character then onCharacterAdded(player.Character,all[id])end
+	player.CharacterAdded:Connect(function(c)onCharacterAdded(c,all[id]) end)
+end
+game.Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in game.Players:GetPlayers() do
+	onPlayerAdded(player)
+end
+local function pickup(player,part,data)
+	remote:FireAllClients("pickupAnim",part,position(player.Character))
+	task.wait(0.5)
+	local inventory=all[player.Character:GetAttribute("eid")].inventory
+	for slot, item in inventory do
+		if item.stack and item.kind==part.Name then
+			item.stack+=1
+			remote:FireClient(player,"stack",slot,item.stack)
+			return
+		end
+	end
+	local slot=#inventory+1
+	local item=table.clone(data)
+	item.model=part
+	part.Parent=nil
+	table.insert(inventory,item)
+	remote:FireClient(player,"itemAdded",slot,item)
+end
+local function unequip(char)
+	char.model["Right Arm"].Grip.Part1=nil
+	char.inventory[table.find(char.inventory,char.equippedItem)].model.Parent=nil
+	char.equippedItem=nil
+	remote:FireClient(char.player,"equippedItemSlot",nil)
+end
+local function consume(self,item)
+	local slot = table.find(self.inventory,item)
+	if item.stack then
+		item.stack-=1
+		remote:FireClient("stackChanged",slot,item.stack)
+		return
+	end
+	if self.equippedItem==item then
+		unequip(self)
+	end
+	table.remove(self.inventory,slot)
+	item.owner=nil
+	remote:FireClient(self.player,"itemRemoved",slot)
+end
+local function newLoot(part,data)
+	part.Handle.ProximityPrompt.Triggered:Connect(function(player)
+		part.Handle.ProximityPrompt:Destroy()
+		pickup(player,part,data)
+	end)
+end
+local oneToFour={Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four}
+local itemKeybinds={Enum.UserInputType.MouseButton1,Enum.UserInputType.MouseButton2,Enum.KeyCode.Z}
+remote.OnServerEvent:Connect(function(player,topic,...)
+	if topic=="input"then
+		local state,keycode,userinputtype,mouseArg=...
+		local char=all[player.Character:GetAttribute("eid")]
+		local slot=table.find(oneToFour,keycode)
+		if state==Enum.UserInputState.End and slot then
+			if char.inventory[slot]==nil then return end
+			if char.equippedItem then
+				local equipped=char.equippedItem
+				unequip(char)
+				if equipped.onUnequipped then
+					task.spawn(equipped.onUnequipped,equipped,char)
+				end
+				if equipped==char.inventory[slot] then
+					return
+				end
+			end
+			char.model["Right Arm"].Grip.Part1=char.inventory[slot].model.Handle
+			char.inventory[slot].model.Parent=workspace
+			char.equippedItem=char.inventory[slot]
+			remote:FireClient(player,"equippedItemSlot",slot)
+			if char.equippedItem.onEquipped then
+				task.spawn(char.equippedItem.onEquipped,char.equippedItem,char)
+			end
+		end
+		local itemKeybind=table.find(itemKeybinds,userinputtype)and userinputtype
+			or table.find(itemKeybinds,keycode) and keycode
+		if state and itemKeybind then
+			local equipped=char.equippedItem
+			if equipped then
+				equipped.onActivated(equipped,char,itemKeybind,state,mouseArg)
+			end
+		end
+	end
+end)
+local nextPid=1
+local function projectile(user,model,x0,v0,g)
+	local start=tick()
+	local t=0
+	local id=nextPid
+	nextPid+=1
+	remote:FireAllClients("projectile",id,x0,v0,g,model,start)
+	local accum=0
+	local prev=x0
+	local params=RaycastParams.new()
+	params.FilterType=Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances={user.model,}
+	local conn
+	conn=game:GetService("RunService").Heartbeat:Connect(function(dt)
+		accum+=dt
+		t+=dt
+		if accum>=0.1 then
+			local cur=util.projectilePosition(x0,v0,t,g)
+			local result=workspace:Raycast(prev,cur-prev,params)
+			prev=cur
+			if result then
+				local model=result.Instance:FindFirstAncestorWhichIsA("Model")
+				if model and model:GetAttribute("eid") then
+					local e=all[model:GetAttribute("eid")]
+					e.hit:Fire("projectile",model,result)
+				end
+				remote:FireAllClients("projectileHit",id,result.Position,result.Normal)
+				conn:Disconnect()
+			end
+			accum-=0.1
+		end
+	end)
+end
+function closestPlayer(part)
+	local closest=math.huge
+	local closestPlayer
+	for _,player in game:GetService("Players"):GetPlayers() do
+		local d=(player.Character.HumanoidRootPart.Position-part.Position).Magnitude
+		if player.Character and d<=closest then
+			closest=d
+			closestPlayer=player.Character
+		end
+	end
+	return closestPlayer,closest
+end
+local function playAnim(c,name,args)
+	local anim=game.ReplicatedStorage.assets:FindFirstChild(name,true)
+	local t=c.Humanoid:LoadAnimation(anim)
+	args=args or {}
+	local fade=args.fadeIn
+	local weight=args.weight
+	local speed=args.speed
+	t:Play(fade,weight,speed)
+	return t
+end
+local function emit(c,particle,amount)
+	local asset=game.ReplicatedStorage.assets:FindFirstChild(particle,true):Clone()
+	local a=Instance.new("Attachment")
+	a.Parent=c.HumanoidRootPart
+	local p=asset:Clone()
+	p.Parent=a
+	p.Enabled=false
+	p:Emit(amount or 1)
+	game.Debris:addItem(a,15)
+end
+local function flashHighlight(c,flash,dur)
+	local asset=game.ReplicatedStorage.assets:FindFirstChild(flash,true):Clone()
+	asset.Parent=c
+	game.Debris:AddItem(asset,dur)
+end
+local rock=workspace.Rock
+for _,rock in game.CollectionService:GetTagged("rock") do
+	local rockHoldAnimation
+	local holdStart
+	newLoot(rock,{onActivated=function(self,user,key,state,mouseArg)
+		if key==Enum.UserInputType.MouseButton1 and state==Enum.UserInputState.Begin then
+			rockHoldAnimation=playAnim(user.model,'rockHoldAnimation')
+			holdStart=tick()
+		end
+		if key==Enum.UserInputType.MouseButton1 and state==Enum.UserInputState.End then
+			local power=math.clamp(tick()-holdStart,1.5,1.5)*200
+			local goal = mouseArg.ray.Origin+mouseArg.ray.Direction*mouseArg.length
+			playAnim(user.model,'rockThrowAnimation')
+			rockHoldAnimation:Stop(0)
+			consume(user,self)
+			local x0=(user.model.HumanoidRootPart.CFrame*CFrame.new(1,1,0)).Position
+			local v0=CFrame.new(x0,goal).LookVector*power
+			projectile(user,"rock",x0,v0,-6)
+		end
+	end,})
+end
+for _,sword in game.CollectionService:GetTagged("broadsword") do
+	local chargeStart
+	local swingTrack
+	newLoot(sword,{onActivated=function(self,user,key,state)
+		if key==Enum.UserInputType.MouseButton1 and state==Enum.UserInputState.Begin then
+			if user.isAttacking then
+				return
+			end
+			user.isAttacking=true
+			chargeStart=tick()
+			local t:AnimationTrack=playAnim(user.model,"broadswordAttack")
+			swingTrack=t
+			user.model.Humanoid.WalkSpeed=0
+			t:GetMarkerReachedSignal("Charge"):Wait()
+			if user.finishedCharging then
+				return
+			end
+			t:AdjustSpeed(0)
+			task.delay(0.75,function()
+				if not user.isAttacking then
+					return
+				end
+				emit(user.model,"chargedParticle",1)
+			end)
+		end
+		if key==Enum.UserInputType.MouseButton1 and state==Enum.UserInputState.End then
+			if not user.isAttacking then
+				return
+			end
+			user.finishedCharging=true
+			local damage=40
+			if tick()-chargeStart>=0.75 then
+				damage=70
+				flashHighlight(self.model,"critFlash",1.5)
+			end
+			self.model.Handle.Trail.Enabled=true
+			swingTrack:AdjustSpeed(1)
+			
+			local damageConn
+			damageConn=self.model.Blade.Touched:Connect(function(p)
+				local model=p:FindFirstAncestorWhichIsA("Model")
+				if model and model:FindFirstChild("Humanoid") and model:GetAttribute("eid") then
+					print(all,model:GetAttribute('eid'))
+					local hitData=all[model:GetAttribute('eid')]
+					if hitData==nil then
+						return
+					end
+					damageConn:Disconnect()
+					if hitData.staggered then
+						model.Humanoid.Health-=30
+					end
+					model.Humanoid.Health-=damage
+				end
+			end)
+			task.delay(0.3,function()
+				self.model.Handle.Trail.Enabled=false
+			end)
+			user.model.Humanoid.WalkSpeed=16
+			swingTrack.Stopped:Wait()
+			user.finishedCharging=false
+			user.isAttacking=false
+			damageConn:Disconnect()
+		end
+	end,
+	onEquipped=function(self,user)
+		user.model.Humanoid.WalkSpeed=8
+		user.model.Humanoid.JumpPower=20
+	end,
+	onUnequipped=function(self,user)
+		user.model.Humanoid.WalkSpeed=16
+		user.model.Humanoid.JumpPower=50
+	end,})
+end
+local function ragdoll(c)
+	print("RAGDOLLED")
+	c.Humanoid.HipHeight=-2
+	local limbs={"Right Arm","Right Leg","Left Arm","Left Leg"}
+	for _, limb in limbs do
+		c[limb].CanCollide=true
+	end
+	c.Humanoid.EvaluateStateMachine=false
+	for index,joint in pairs(c:GetDescendants()) do
+		if joint:IsA("Motor6D") then
+			if not joint.Part0 or not joint.Part1 then
+				continue
+			end
+			local socket = joint.Parent:FindFirstChild("RagdollBallSocket"..joint.Name) or Instance.new("BallSocketConstraint")
+			local a1 = joint.Part0:FindFirstChild("RagdollAttachment"..joint.Name) or Instance.new("Attachment")
+			local a2 = joint.Part1:FindFirstChild("RagdollAttachment"..joint.Name) or Instance.new("Attachment")
+			a1.Name = "RagdollAttachment"..joint.Name
+			a2.Name = "RagdollAttachment"..joint.Name
+			a1.Parent = joint.Part0
+			a2.Parent = joint.Part1
+			socket.Parent = joint.Parent
+			socket.Name="RagdollBallSocket"..joint.Name
+			socket.Attachment0 = a1
+			socket.Attachment1 = a2
+			a1.CFrame = joint.C0
+			a2.CFrame = joint.C1
+			socket.LimitsEnabled = true
+			socket.TwistLimitsEnabled = true
+			joint.Enabled=false
+		end
+	end
+end
+local function unragdoll(c)
+	for index,joint in pairs(c:GetDescendants()) do
+		if joint:IsA("Motor6D") then
+			local socket = joint.Parent:FindFirstChild("RagdollBallSocket"..joint.Name) or Instance.new("BallSocketConstraint")
+			socket.Enabled=false
+			joint.Enabled=true
+		end
+	end
+end
+local moveToConn
+local controller=workspace.BadGuy.ControllerManager
+local isAttacking=false
+workspace.BadGuy:SetAttribute("eid",nextEid)
+local badGuyId=nextEid
+all[nextEid]={
+	hit=event.new(),
+	staggered=false,
+}
+nextEid+=1
+local attackReady=false
+local throwingAttackReady=false
+local stunned=false
+local staggered=false
+every(0.5,function(dt)
+	if all[badGuyId].disabled then
+		return
+	end
+	if isAttacking then
+		return
+	end
+	if stunned then
+		return
+	end
+	local player,distance=closestPlayer(workspace.BadGuy.HumanoidRootPart)
+	local toPlayer=player.HumanoidRootPart.Position-workspace.BadGuy.HumanoidRootPart.Position
+	if player and distance < 40 then
+		workspace.BadGuy.ControllerManager.FacingDirection=toPlayer.Unit
+	end
+	local dot=workspace.BadGuy.HumanoidRootPart.CFrame.LookVector.Unit:Dot(toPlayer.Unit)
+	if dot>0.4 then
+		workspace.BadGuy.ControllerManager.MovingDirection=toPlayer.Unit
+	else
+		workspace.BadGuy.ControllerManager.MovingDirection=Vector3.zero
+	end
+	if throwingAttackReady then
+		throwingAttackReady=false
+		for _,player in game:GetService("Players"):GetPlayers() do
+			if player.Character and tick()-(player.Character:GetAttribute("LastMoved") or tick())>=1 then
+				if (position(player.Character)-workspace.BadGuy.HumanoidRootPart.Position).Magnitude<=30 then
+					local selfPos=workspace.BadGuy.HumanoidRootPart.Position
+					for i=0,1,0.5 do
+						for angle=0,360,60 do
+							local offset=Vector3.new(math.cos(math.rad(angle))*i,math.sin(math.rad(angle))*i,math.random(-2,2))
+							local goal=player.Character.HumanoidRootPart.CFrame:ToWorldSpace(CFrame.new(offset)).Position
+							projectile(all[badGuyId],"rock",selfPos,(goal-selfPos).Unit*100,-6)
+						end
+					end
+				end
+			end
+		end
+	end
+	if math.random(1,6)==1 then
+		attackReady=true
+	end
+	if math.random(1,8)==1 then
+		throwingAttackReady=true
+		return
+	end
+	
+	if attackReady and distance < 15 then
+		--anim
+		isAttacking=true
+		local disconnectCancel
+		local hitConn
+		local t=playAnim(workspace.BadGuy,'boulderSwing',{speed=if staggered then 0.7 else 1})
+		local cancelled=false
+		disconnectCancel=all[badGuyId].hit:Connect(function(damageType,name,result)
+			if result.Instance~=workspace.BadGuy.Head then
+				return
+			end
+			stunned=true
+			attackReady=false
+			isAttacking=false
+			cancelled=true
+			staggered=true
+			all[badGuyId].staggered=true
+			throwingAttackReady=false
+			controller.BaseMoveSpeed=4
+			if t.IsPlaying then
+				t:Stop()
+			end
+			controller.MovingDirection=Vector3.zero
+			playAnim(workspace.BadGuy,"badGuyStaggered")
+			disconnectCancel()
+			if hitConn then
+				hitConn:Disconnect()
+			end
+			task.delay(1,function()
+				stunned=false
+			end)
+		end)
+		print(staggered)
+		task.wait(0.8*if staggered then 1/0.7 else 1)
+		if cancelled then
+			return
+		end
+		hitConn=workspace.Boulder.Touched:Connect(function(p)
+			local model=p:FindFirstAncestorWhichIsA("Model")
+			if model:FindFirstChild("Humanoid") then
+				hitConn:Disconnect()
+				model.HumanoidRootPart:SetNetworkOwner(nil)
+				model.Humanoid:ChangeState(Enum.HumanoidStateType.Ragdoll)
+				ragdoll(model)
+				task.delay(1,function()
+					local player=game.Players:GetPlayerFromCharacter(model)
+					if model:FindFirstChild("HumanoidRootPart") and player then
+						model.HumanoidRootPart:SetNetworkOwner(player)
+					end
+				end)
+				local force=workspace.BadGuy.HumanoidRootPart.CFrame.LookVector*400
+				model.HumanoidRootPart.AssemblyLinearVelocity=force
+				model.Humanoid.Health-=80
+			end
+		end)
+		t.Stopped:Wait()
+		if cancelled then
+			return
+		end
+		disconnectCancel()
+		hitConn:Disconnect()
+		attackReady=false
+		isAttacking=false
+		throwingAttackReady=false
+	end
+end)
+local diedConn
+diedConn = workspace.BadGuy.Humanoid.Died:Connect(function()
+	controller.MovingDirection=Vector3.zero
+	controller.FacingDirection=Vector3.zero
+	controller.GroundController.GroundOffset=0
+	all[badGuyId].disabled=true
+	ragdoll(workspace.BadGuy)
+	diedConn:Disconnect()
+end)
