@@ -1,0 +1,811 @@
+local signals={}
+local configurations={}
+local classes={}
+local library={}
+local services={}
+local entities={}--anything with a model
+local nextEid = 1
+local tables={
+	signals=signals,
+	configurations=configurations,
+	library=library,
+	classes=classes,
+	services=services,
+}
+services.item={}::itemService
+services.player={}::playerService
+--[[my own version of assert, faster and can be disabled]]
+function library.assert(condition, strPattern, ...)
+	if not condition then
+		error(string.format(strPattern,...))
+	end
+	return condition
+end
+--[[
+	adding a bunch of the same class to a table
+	for example values
+]]
+library.addClassToTable = function(className,tbl,values,maid)
+	for _, name in values do
+		tbl[name] = classes[className].new()
+		if maid then
+			maid:add(tbl[name])
+		end
+	end
+end
+library.isMixed = function(t)
+	local array_count = 0
+	local total_count = 0
+	for _ in ipairs(t) do array_count = array_count + 1 end
+	for _ in pairs(t) do total_count = total_count + 1 end
+	return array_count > 0 and total_count > array_count
+end
+library.none = {}
+type connectionImpl={
+	__index : connectionImpl,
+	new:((...any)->())->connection,
+	destroy:(self:connection)->(),
+	disconnect:(self:connection)->(),
+	reconnect:(self:connection)->(),
+}
+type connection=typeof(setmetatable({}::{_isDisconnected:boolean,_fn:(...any)->()},{}::connectionImpl))
+
+classes.connection={
+	new=function(fn)
+		return setmetatable({_fn=fn},classes.connection)
+	end,
+	destroy=function(self)
+		self._isDisconnected = true
+	end,
+	reconnect=function(self)
+		self._isDisconnected = false
+	end,
+}::connectionImpl
+classes.connection.__index=classes.connection
+classes.connection.disconnect=classes.connection.destroy
+
+type signalImpl={
+	__index : signalImpl,
+	new:()->signal,
+	connect:(self:signal,fn:(...any)->nil)->connection,
+	fire:(self:signal,...any)->nil,
+	destroy:(self:signal)->(),
+	runThread:thread?,
+	_createRunThread:()->(),
+	_run:((...any)->(),...any)->(),
+	_runLoop:()->(),
+	wait:(self:signal)->nil,
+	once:(self:signal,fn:any)->connection,
+	disconnectCurrent:(self:signal)->()
+}
+type signal=typeof(setmetatable({}::{
+	_conns:{[number]:connection},
+	_doDisconnectCurrent:boolean,
+},{}::signalImpl))
+
+classes.signal={
+	_run=function(fn,...)
+		classes.signal.runThread = nil
+		fn(...)
+		if classes.signal.runThread == nil then
+			classes.signal.runThread = coroutine.running()
+		end
+	end,
+	_runLoop=function()--to avoid recursive errors
+		while true do
+			classes.signal._run(coroutine.yield())
+		end
+	end,
+	_createRunThread=function()
+		local runThread = coroutine.create(classes.signal._runLoop)
+		task.spawn(runThread)
+		return runThread
+	end,
+	new=function()
+		return setmetatable({_conns={}},classes.signal)
+	end,
+	connect=function(self:signal,fn)
+		library.assert(type(fn)=="function","can't connect non function")
+		local _conns=library.assert(self._conns,"signal missing _conns. bad constructor?")
+		local conn=classes.connection.new(fn)
+		table.insert(_conns, conn)
+		return conn
+	end,
+	fire=function(self:signal,...)
+		local _conns=library.assert(self._conns,"signal missing _conns. bad constructor?")
+		--[[ attempt to reuse the runThread (faster), otherwise create our own ]]
+		for _, conn in _conns do
+			if conn._isDisconnected then
+				print(conn._isDisconnected)
+				continue
+			end
+			if conn._once then
+				conn:disconnect()
+			end
+			--[[  thread is not availible so we will make our own ]]
+			if classes.signal.runThread == nil then
+				classes.signal.runThread = self._createRunThread()
+			end
+			task.spawn(classes.signal.runThread :: thread,conn._fn,...)
+			if self._doDisconnectCurrent then
+				conn:disconnect()
+				self._doDisconnectCurrent = false
+			end
+			--the ::thread is to shut up the compiler
+		end
+		for i=#_conns,1,-1 do
+			if _conns[i]._isDisconnected then
+				table.remove(_conns,i)
+			end
+		end
+	end,
+	once = function(self,fn)
+		library.assert(type(fn)=="function","can't connect non function")
+		local _conns=library.assert(self._conns,"signal missing _conns. bad constructor?")
+		local conn=classes.connection.new(fn)
+		conn._once=true
+		table.insert(_conns, conn)
+		return conn
+	end,
+	wait = function(self)
+		local c=coroutine.running()
+		local finished=false
+		self:once(function()
+			finished=true
+			task.spawn(c)
+		end)
+		if not finished then
+			coroutine.yield()
+		end
+	end,
+	--[[ disconnects the currently running connection ]]
+	disconnectCurrent=function(self)
+		self._doDisconnectCurrent = true
+	end,
+}::signalImpl
+classes.signal.__index=classes.signal
+
+-- the things I do for autocomplete spas.signals
+signals.setupFinished = classes.signal.new()
+signals.playerAdded = classes.signal.new()
+signals.playerRemoved = classes.signal.new()
+signals.playerKicked = classes.signal.new()
+signals.entityAdded = classes.signal.new()
+
+export type maidImpl = {
+	__index : maidImpl,
+	new : ()->maid,
+	destroy : (self:maid)->(),
+	add : (self:maid,t:any)->nil,
+	clean : (self:maid,name:string)->(),
+	remove : (self:maid,t:any)->nil,
+}
+local function clean(t)
+	if type(t)=="function"then
+		task.spawn(t)
+		return
+	end
+	if type(t)=="userdata"and typeof(t)==("RBXScriptConnection") then
+		t:Disconnect()
+		return
+	end
+	if type(t)=="userdata" then
+		t:Destroy()
+		return
+	end
+	if t.destroy then
+		t:destroy()
+		return
+	end
+end
+export type maid = typeof(setmetatable({}::{_tasks:{}},{}::maidImpl))
+classes.maid = {
+	new = function()
+		return setmetatable({_tasks={}},classes.maid)
+	end,
+	destroy = function(self)
+		for i, t in self._tasks do
+			self._tasks[i]=nil
+			clean(t)
+		end
+	end,
+	add = function(self,t)
+		table.insert(self._tasks,t)
+	end,
+	remove = function(self,t)
+		local idx = library.assert(table.find(self._tasks,t),"can't remove non added task from maid")
+		self._tasks[idx]=nil
+	end,
+}::maidImpl
+classes.maid.__index=classes.maid
+
+export type valueImpl = {
+	__index : valueImpl,
+	get : (self:value)->any,
+	set : (self:value,v:any)->(), -- if the value is a function, it will call that instead
+	link : (self:value,...value)->(), -- uses other values to generate your own value
+	observe : (self:value,fn:(a:any)->())->connection,
+	increment : (self:value,a:number)->nil,
+	replicate : (self:value,players:Player&{[number]:Player})->(),
+	new :(default:any)->value,
+	destroy:(self:value)->()
+}
+export type value = typeof(setmetatable({}::{
+	_value:any,
+	_conns:{[number]:connection},
+	_linkConns:{[number]:connection},
+	_changed:signal,
+},{}::valueImpl))
+classes.value = {
+	new = function(default)
+		local v = setmetatable({_conns={},_linkConns={},_changed=classes.signal.new()},classes.value)
+		if type(default)=="function" then
+			v._calculate = default
+		end
+		if default and type(default) ~= "function" then
+			v:set(default)
+		end
+		return v
+	end,
+	increment = function(self,amount)
+		self:set(self:get()+amount)
+	end,
+	set = function(self,new)
+		library.assert(self._value~=new,"set to same value "..`old: {self._value}\nnew:{new}`)
+		self._value=new
+		self._changed:fire(new)
+	end,
+	--link to other objects values (for calculate)
+	link = function(self,link)
+		library.assert(self._link==nil,"can't link already linked values")
+		local calculate = library.assert(self._calculate,"can't link if there's no calculate function to link to")
+		self._link=link
+		self:set(self._calculate(link))
+		for sectionName,section in self._link do
+			if section.observe then
+				section:observe(function()
+					self:set(self._calculate(link))
+				end)
+				continue
+			end
+			local filter = section.filter
+			if section.values then
+				for _, value in section.values do
+					local values
+					if filter then
+						values=filter(value)
+					else
+						values={value}
+					end
+					for _, value in values do
+						if type(value)=="table" and value.observe then
+							self._linkConns[value] = value._changed:connect(function()
+								self:set(self._calculate(link))
+							end)
+						end
+					end
+					self:set(self._calculate(link))
+				end
+				if section.added then
+					section.added:connect(function(value)
+						local values
+						if filter then
+							values=filter(value)
+						else
+							values={value}
+						end
+						for _, value in values do
+							self._linkConns[value] = value._changed:connect(function(v)
+								self:set(self._calculate(link))
+							end)
+						end
+						self:set(self._calculate(link))
+					end)
+					section.removed:connect(function(value)
+						local values
+						if filter then
+							values=filter(value)
+						else
+							values={value}
+						end
+						for _, value in values do
+							self._linkConns[value]:disconnect()
+							self:set(self._calculate(link))
+						end
+					end)
+				end
+			end
+		end
+	end,
+	observe = function(self,fn)
+		task.spawn(fn,self._value)
+		local conn = self._changed:connect(fn)
+		table.insert(self._conns,conn)
+		return conn
+	end,
+	get = function(self)
+		return self._value
+	end,
+	destroy = function(self)
+		self:set(nil)
+		for _,conn in self._conns do
+			conn:disconnect()
+		end
+		for _,conn in self._linkConns do
+			conn:disconnect()
+		end
+	end,
+}::valueImpl
+classes.value.__index=classes.value
+
+export type zoneImpl = {
+	__index : zoneImpl,
+	new : (p:Part) -> zone,
+}
+
+export type zone = typeof(setmetatable({}::{
+	spasnoidEntered : signal,
+	modelEntered : signal,
+},{}::zoneImpl))
+
+export type spasnoidImpl = {
+	__index : spasnoidImpl,
+	new : () -> spasnoid,
+	birth : (self:spasnoid,model:Model)->(),
+	kill : (self:spasnoid,model:Model)->(),
+	knock : (self:spasnoid)->(),
+	give : (self:spasnoid,item:item)->nil,
+	equip : (self:spasnoid,item:item)->nil,
+	unequip : (self:spasnoid)->nil,
+}
+export type spasnoid = typeof(setmetatable({}::{
+	inventory:{},
+	health:value,
+	inRagdoll:value,
+	equipped:value,
+	itemAdded:signal,
+	itemRemoved:signal,
+	temperature:value,
+	hunger:value,
+	digestion:{},
+	speed:value,
+	weight:value,
+	_maid:maid,
+},{}::spasnoidImpl))
+classes.spasnoid = {
+	new = function()
+		local self = {
+			health=classes.value.new(),
+			inventory={},
+			inRagdoll=classes.value.new(),
+			itemAdded = classes.signal.new(),
+			equipped = classes.value.new(),
+			itemRemoved = classes.signal.new(),
+			speed = classes.value.new(16),
+			digestion = {},
+			hunger = classes.value.new(),
+			temperature = classes.value.new(100),
+			_maid=classes.maid.new(),
+		}
+		self.weight = classes.value.new(function(link)
+			local sum = 0
+			for _, item in link.item.values do
+				sum += (item.weight:get() or 0) * (item.stack:get() or 1)
+			end
+			return sum
+		end)
+		self.weight:link({
+			item={
+				values = self.inventory,
+				added = self.itemAdded,
+				removed = self.itemRemoved,
+				filter = function(item)
+					return {item.weight,item.stack}
+				end,
+			}
+		})
+		setmetatable(self, classes.spasnoid)
+		local id = nextEid
+		nextEid += 1
+		self.eid = classes.value.new(id)
+		entities[id] = self
+		self._maid:add(function()
+			entities[id]=nil
+		end)
+		signals.entityAdded:fire(self)
+		return self
+	end,
+	equip = function(self,item)
+		if self.equipped:get() then
+			self:unequip()
+		end
+		local grip = library.assert(self.model["Right Arm"]:FindFirstChild("Grip"),"spasnoid missing grip")
+		grip.Part1 = item.model:get().Handle
+		item.model:get().Parent = workspace
+		self.equipped:set(item)
+	end,
+	unequip = function(self)
+		library.assert(self.equipped:get(),"can't unequip if there's nothing equipped")
+		local item=self.equipped:get()
+		local grip = library.assert(self.model["Right Arm"]:FindFirstChild("Grip"),"spasnoid missing grip")
+		grip.Part1 = nil
+		item.model:get().Parent = nil
+		self.equipped:set(nil)
+	end,
+	birth = function(self,model)
+		library.assert(self.model==nil,"can not birth a spasnoid while it is alive")
+		self.model=model
+		if model["Right Arm"]:FindFirstChild("Grip")==nil then
+			local grip=Instance.new("Motor6D")
+			grip.Name = "Grip"
+			grip.Parent = model["Right Arm"]
+			grip.Part0 = grip.Parent
+		end
+	end,
+	knock = function()
+		
+	end,
+	kill = function(self,model)
+		self.model=nil
+	end,
+	give = function(self,item)
+		if self.weight:get() + (item.weight:get() or 0) > 10 then
+			error("too heavy...")
+		end
+		item.owner:set(self)
+		for _, other in self.inventory do
+			--epic stacking,item is destroyed tho
+			if other.kind:get()==item.kind:get()and other.stack:get()~=nil then
+				item:destroy()
+				other.stack:increment(1)
+				return
+			end
+		end
+		local slot = #self.inventory+1
+		self.inventory[slot]=item
+		self.itemAdded:fire(item,slot)
+		item.model:get().Parent = nil
+	end,
+} :: spasnoidImpl
+classes.spasnoid.__index=classes.spasnoid
+
+export type itemImpl = {
+	__index : itemImpl,
+	new : () -> item,
+	owner : spasnoid?,
+	getHandle : (self:item)->Part,
+	destroy : (self:item)->nil,
+	manifest : (self : item,model:Model) -> (),
+}
+export type item = typeof(setmetatable({}::{
+	manifested : signal,
+	model : value,
+	owner :value,
+	stack : value,
+	hidden : value,
+	weight : value,
+	kind:value,
+	_maid : maid,
+},{}::itemImpl))
+
+--[[ items can be stacked and split ]]
+classes.item = {
+	new = function()
+		local self = {
+			manifested=classes.signal.new(),
+			model=classes.value.new(),
+			owner=classes.value.new(),
+			stack=classes.value.new(),
+			weight=classes.value.new(),
+			kind=classes.value.new(),--kind determines MANY interactions, items of the same kind stack
+			_maid = classes.maid.new(),
+		}
+		library.addClassToTable("value",self,{
+			"model","owner","stack","weight","kind"
+		},self._maid)
+		return setmetatable(self,classes.item)
+	end,
+	destroy = function(self)
+		self._maid:destroy()
+	end,
+	getHandle = function(self)
+		local model = library.assert(self.model:get(),"cant get handle, no model")
+		return library.assert(model:FindFirstChild("Handle"),"%s missing handle",model.Name)
+	end,
+	manifest = function(self,model)
+		library.assert(self.model:get()==nil,"a manifested item can't be manifested again")
+		self.model:set(model)
+		services.item.added:fire(self)
+		self._maid:add(model)
+		self.manifested:fire(self.model)
+	end,
+}::itemImpl
+classes.item.__index=classes.item
+
+export type skillImpl = {
+	
+}
+
+export type skill = typeof(setmetatable({}::{
+	active:value,
+},{}::skillImpl))
+
+classes.skill = {
+	new = function(user : spasnoid)
+		
+	end,
+	
+}
+--configuration depends on value so we use it below value
+configurations.assets = classes.value.new() -- the things I do for syntax highlighting
+if game.ReplicatedStorage:FindFirstChild("assets") then
+	configurations.assets:set(game.ReplicatedStorage.assets)
+end
+configurations.remote = classes.value.new()
+if game.ReplicatedStorage:FindFirstChild("remote") then
+	configurations.remote:set(game.ReplicatedStorage.remote)
+end
+
+library.getAsset = function(name)
+	local assets = library.assert(configurations.assets:get(),"must set an assets folder or create game.ReplicatedStorage.assets")
+	return library.assert(assets:FindFirstChild(name, true),"missing %s asset",name)
+end
+
+library.upperFirstLetter=function(str:string)
+	return str:sub(1,1):upper()..str:sub(2)
+end
+--[[ standard heartbeat update ]]
+library.updateEvery = function(seconds, fn)
+	local accum=0
+	return game:GetService("RunService").Heartbeat:Connect(function(dt)
+		accum+=dt
+		if accum >= seconds then
+			accum-=seconds
+			fn(dt)
+		end
+	end)
+end
+
+library.playAnim = function(c,name,args)
+	local anim=game.ReplicatedStorage.assets:FindFirstChild(name,true)
+	local t=c.Humanoid:LoadAnimation(anim)
+	args=args or {}
+	local fade=args.fadeIn
+	local weight=args.weight
+	local speed=args.speed
+	t:Play(fade,weight,speed)
+	return t
+end
+
+library.emit = function(c,particle,amount)
+	local asset=game.ReplicatedStorage.assets:FindFirstChild(particle,true):Clone()
+	local a=Instance.new("Attachment")
+	a.Parent=c.HumanoidRootPart
+	local p=asset:Clone()
+	p.Parent=a
+	p.Enabled=false
+	p:Emit(amount or 1)
+	game.Debris:AddItem(a,15)
+end
+
+--[[
+	all sharks have a weight, pass in a group of sharks and you'll get
+	all of their weights.
+]]
+library.getCommonArrayProperty = function(array, propertyKey)
+	local props={}
+	for _, v in array do
+		if v[propertyKey]==nil then
+			table.insert(props,library.none)
+			continue
+		end
+		table.insert(props,v[propertyKey])
+	end
+	return props
+end
+
+--maybe should make this its own class, don't really care tho
+library.combineSignals = function(signalList)
+	local combinedSignal = classes.signal.new()
+	local conns = {}
+	for _, signal in signalList do
+		table.insert(conns,signal:connect(function(...)
+			combinedSignal:fire(...)
+		end))
+	end
+	local function destroy()
+		for _,conn in conns do
+			conn:disconnect()
+		end
+	end
+	return {
+		connect=function(self,fn)
+			return combinedSignal:connect(fn)
+		end,
+		destroy=destroy,
+	} :: {
+		connect:(self:{},fn:()->())->(),
+		destroy:(self:{})->()
+	}
+end
+
+export type playerService={
+	container:{},
+	setup:()->(),
+	getSpasnoid:(player:Player)->spasnoid
+}
+export type itemService={
+	container:{},
+	setup:()->(),
+	added:signal,
+}
+export type weatherService={
+	zones:{},
+}
+services.player = {
+	container={},
+	setup = function()
+		--setup the remote too
+		if configurations.remote:get()==nil then
+			configurations.remote:set(Instance.new("RemoteEvent"))
+		end
+		local remote=configurations.remote:get()
+		remote.Name="remote"
+		remote.Parent = game.ReplicatedStorage
+		game.Players.PlayerAdded:Connect(function(player)
+			local playerTable={
+				joinTime=tick(),
+				player=player,
+				spasnoid=classes.spasnoid.new(),
+				net={},
+			}
+			services.player.container[player]=playerTable
+			signals.playerAdded:fire(services.player.container[player])
+			if player.Character then
+				playerTable.spasnoid:birth(player.Character)
+			end
+			player.CharacterAdded:Connect(function(character)
+				playerTable.spasnoid:birth(character)
+			end)
+			local spasnoid=playerTable.spasnoid
+			local function observe(name,filter)
+				spasnoid[name]:observe(function(...)
+					if filter then
+						remote:FireClient(player,name.."Changed",filter(...))
+					else
+						remote:FireClient(player,name.."Changed",...)
+					end
+				end)
+			end
+			local function connect(name,filter)
+				spasnoid[name]:connect(function(...)
+					if filter then
+						remote:FireClient(player,name,filter(...))
+					else
+						remote:FireClient(player,name,...)
+					end
+				end)
+			end
+			observe("health")
+			observe("weight")
+			observe("temperature")
+			observe("equipped",function(item)
+				return table.find(spasnoid.inventory,item)
+			end)
+			spasnoid._maid:add(spasnoid.itemAdded:connect(function(item:item)
+				item.stack._changed:connect(function(stack)
+					remote:FireClient(player,"stackChanged",item.stack:get(),table.find(spasnoid.inventory,item))
+				end)
+				item.owner._changed:wait()
+			end))
+			connect("itemAdded",function(item,slot)
+				return {
+					kind=item.kind:get(),
+					stack=item.stack:get(),
+				}, slot
+			end)
+			connect("itemRemoved")
+		end)
+		--setup remote event
+		remote.OnServerEvent:Connect(function(player,topic,...)
+			local playerTable = services.player.container[player]
+			library.assert(playerTable,"player not loaded but sent request!")
+			local handle = services.player["handle"..library.upperFirstLetter(topic)]
+			if handle then
+				handle(playerTable.spasnoid,...)
+			end
+		end)
+		--setup picking up items
+		services.item.added:connect(function(item:item)
+			item.manifested:connect(function()
+				local model = item.model:get()
+				local handle = item:getHandle()
+				if item.owner:get()==nil and handle:FindFirstChild("PickupPrompt")==nil then
+					local prompt = Instance.new("ProximityPrompt")
+					prompt.Parent = handle
+					item._maid:add(prompt.Triggered:Connect(function(player)
+						prompt.Enabled=false
+						local spasnoid = services.player.getSpasnoid(player)
+						if spasnoid == nil then
+							return
+						end
+						spasnoid:give(item)
+					end))
+				end
+			end)
+		end)
+	end,
+	handleItemInput = function()
+		local a = {}::itemService
+		
+	end,
+	handleEquip = function(spasnoid:spasnoid,slot)
+		local equippedSlot = table.find(spasnoid.inventory,spasnoid.equipped:get())
+		
+		if equippedSlot == slot then
+			spasnoid:unequip()
+		else
+			local ok, err = pcall(function()
+				return spasnoid:equip(spasnoid.inventory[slot])
+			end)
+			if err then
+				print(err)
+			end
+		end
+	end,
+	getSpasnoid=function(player)
+		local playerTable = library.assert(services.player.container[player],"player isnt loaded yet")
+		return playerTable.spasnoid
+	end,
+	replicateValues = function(eid,tbl,target)
+		configurations.remote:get():FireClient(target,"entityCreated",eid,tbl)
+		for name, value in tbl do
+			if type(value)=="table" and type(value.observe)=="function" then
+				value:observe(function(v)
+					configurations.remote:get():FireClient(target,"entityChanged",eid,name,v)
+				end)
+			end
+		end
+	end,
+}
+
+services.item = {
+	added = classes.signal.new(),
+	setup = function()
+		
+	end,
+}::itemService
+--[[ updates spasnoids n stuff ]]
+export type spasnoidService={}
+
+services.weather = {
+	setup = function()
+		
+	end,
+	zones = {},
+}
+
+
+--[[steup loads the player, item, etc. services]]
+library.setup = function()
+	local numServices = 0
+	local setupServices = 0
+	local curThread = coroutine.running()
+	for _,service in services do
+		numServices+=1
+	end
+	for _, service in services do
+		task.spawn(function()
+			service.setup()
+			setupServices+=1
+			if setupServices==numServices then
+				coroutine.resume(curThread)
+			end
+		end)
+	end
+	if numServices~=setupServices then
+		coroutine.yield()
+	end
+end
+
+return tables
