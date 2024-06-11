@@ -1,0 +1,99 @@
+local remote=game.ReplicatedStorage:WaitForChild("RemoteEvent")
+local util=require(game.ReplicatedStorage:WaitForChild("util"))
+local projectiles={}
+local mouseInputs={Enum.UserInputType.MouseButton1,Enum.UserInputType.MouseButton2}
+local function repInput(input)
+	local keycode=input.KeyCode
+	local inputtype=input.UserInputType
+	local state=input.UserInputState
+	if table.find(mouseInputs,inputtype) then
+		local mouse=game.UserInputService:GetMouseLocation()
+		local ray=workspace.CurrentCamera:ViewportPointToRay(mouse.X,mouse.Y)
+		local params=RaycastParams.new()
+		params.FilterType=Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances={game.Players.LocalPlayer.Character}
+		local result=workspace:Raycast(ray.Origin,ray.Direction*100,params)
+		remote:FireServer("input",state,keycode,inputtype,{ray=ray,length=result and result.Distance or 100})
+		return
+	end
+	remote:FireServer("input",state,keycode,inputtype)
+end
+local uiFolder=game.ReplicatedFirst.ui
+local tempOverlay=uiFolder.tempOverlay
+for _,child in uiFolder:GetChildren() do
+	child.Parent = game.Players.LocalPlayer.PlayerGui
+end
+uiFolder:Destroy()
+
+local animationIds = {}
+for _,animation in game.ReplicatedStorage:WaitForChild("assets"):WaitForChild("animations"):GetChildren() do
+	table.insert(animationIds,animation.AnimationId)
+end
+local CProvider = game:GetService("ContentProvider")
+task.spawn(function()
+	CProvider:PreloadAsync(animationIds)
+end)
+local function getPlayerChar(eid)
+	for _, j in workspace:GetChildren() do
+		if j:GetAttribute("eid")==eid then
+			return j
+		end
+	end
+end
+local zone=nil
+local rate=nil
+local temperature=100
+game.UserInputService.InputBegan:Connect(repInput)
+game.UserInputService.InputEnded:Connect(repInput)
+remote.OnClientEvent:Connect(function(topic,...)
+	if topic=="projectile"then
+		local id,x0,v0,g,model,start=...
+		model=game.ReplicatedStorage.assets:FindFirstChild(model,true):Clone()
+		model.CanCollide=false
+		model.Parent = workspace
+		local t=tick()-start
+		local data={}
+		projectiles[id]=data
+		data.update=game:GetService("RunService").Heartbeat:Connect(function(dt)
+			t+=dt
+			model:PivotTo(CFrame.new(util.projectilePosition(x0,v0,t,g)))
+		end)
+		data.model=model
+	end
+	if topic=="projectileHit" then
+		local id,pos,normal=...
+		local data=projectiles[id]
+		local cf=CFrame.new(pos,pos+normal)
+		if data.model:FindFirstChild("Hit") then
+			local p=Instance.new("Part")
+			p.Transparency=1
+			p.CanCollide=false
+			p.Anchored=true
+			p.CanQuery=false
+			local a=data.model.Hit
+			a.Parent=p
+			p:PivotTo(cf)
+			p.Parent=workspace
+			a.ParticleEmitter:Emit(1)
+		end
+		data.update:Disconnect()
+		data.model:Destroy()
+		
+	end
+	if topic=="zoneChanged" then
+		local start,_zone,_temp,_rate=...
+		zone=_zone
+		rate=_rate
+		temperature=_temp+(tick()-start)*rate
+	end
+	if topic=="temperatureChanged"then
+		temperature=...
+	end
+end)
+game:GetService("RunService").Heartbeat:Connect(function(dt)
+	if rate then
+		temperature+=dt*rate
+		tempOverlay.Hot.BackgroundTransparency=1-((temperature-100)/100)
+		tempOverlay.Cold.BackgroundTransparency=((temperature/100))
+	end
+end)
